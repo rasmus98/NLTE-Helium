@@ -84,7 +84,7 @@ class Environment:
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
         # TODO: fix back
-        self.T_electrons = self.T_phot#/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) 
+        self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) 
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2))
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*4*np.pi*u.Unit("erg/(s Hz sr cm2)")) 
         self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
@@ -130,9 +130,8 @@ class CollisionProcess:
         self.name = "Collision"
         
     def get_collision_rates(self):
-        gamma_table, species, temperatures = NLTE.collision_rates.get_effective_collision_strengths_table(tuple(self.states.names))
-        gamma = interp1d(temperatures, gamma_table, bounds_error=False)(self.environment.T_electrons) # Todo: include lower temperatures
-        # reorder from "species" order to "states" order
+        gamma_table, temperatures = NLTE.collision_rates.get_effective_collision_strengths_table(tuple(self.states.names))
+        gamma = interp1d(temperatures, gamma_table, bounds_error=True)(self.environment.T_electrons) 
         E_diff = np.maximum(self.states.energies[:,np.newaxis] - self.states.energies, 0*u.eV)
         exponential = np.exp(-E_diff / (consts.k_B * self.environment.T_electrons * u.K))
         return 8.63*10**-6/(np.sqrt(self.environment.T_electrons) * self.states.multiplicities) * gamma * exponential
@@ -140,7 +139,7 @@ class CollisionProcess:
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         coeff_mat[:len(self.states.names), :len(self.states.names)] = self.collision_rates
-        return coeff_mat
+        return coeff_mat*self.environment.n_e
     
 class RadiativeProcess:
     def __init__(self, states, environment):
@@ -244,8 +243,8 @@ class HotElectronIonizationProcess:
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         names = self.states.all_names
         # TODO: fix back
-        #coeff_mat[names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0]
-        coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
+        coeff_mat[names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0]
+       # coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
         coeff_mat[names.index("HeIII"), names.index("HeII")] = self.environment.q_dot / self.w[1]
         return coeff_mat
 

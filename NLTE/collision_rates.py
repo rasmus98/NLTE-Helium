@@ -128,4 +128,4 @@ def get_effective_collision_strengths_table(state_list):
         print("Error: missing states in collision table: ", missing_states)
     state_indices = [species.index(state) for state in state_list]
     gamma_table = gamma_table[state_indices, :, :][:, state_indices, :]
-    return gamma_table, state_list, temperatures
+    return gamma_table, temperatures
