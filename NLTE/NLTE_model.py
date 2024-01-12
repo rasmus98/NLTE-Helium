@@ -19,7 +19,7 @@ import warnings
 # This is valid in the case of much higher transition rates between the ortho levels, than from either of them to the para levels
 @dataclass 
 class States:
-    names : np.array = field(default_factory=lambda: ["11S", "23S", "21S", "23P", "21P", "33S", "31S", "33P", "33D", "31D", "31P"])
+    names : np.array = field(default_factory=lambda: ["11S", "23S", "21S", "23P", "21P", "33S", "31S", "33P", "33D", "31D", "31P"])#, "41S", "41P", "41D", "41F"])
     multiplicities : np.array = np.array([1, 3, 1, 9, 3, 3, 1, 9, 15, 5, 3])
     energies : np.array = np.array([0.00, 19.819614525, 20.615774823, 20.96408688908, 21.2180227112, 22.718466419, 22.920317359, 23.00707314571, 23.07365070854, 23.07407479777, 23.08701852960]) * u.eV
     ionization_species : np.array = field(default_factory=lambda: ["HeII", "HeIII"])
@@ -83,7 +83,6 @@ class Environment:
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
-        # TODO: fix back
         self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) 
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2))
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*4*np.pi*u.Unit("erg/(s Hz sr cm2)")) 
@@ -157,18 +156,18 @@ class RadiativeProcess:
             term = term_series.str.strip("=\"*")
             return n+term
 
-        i_state = get_state_name(nist_table["conf_i"], nist_table["term_i"])
-        j_state = get_state_name(nist_table["conf_k"], nist_table["term_k"])
+        lower_state = get_state_name(nist_table["conf_i"], nist_table["term_i"])
+        upper_state = get_state_name(nist_table["conf_k"], nist_table["term_k"])
+        A_coefficients = pandas.to_numeric(nist_table["Aki(s^-1)"].str.strip("=\"*"))
         names = self.states.names
-        A_coefficients = np.zeros((len(names), len(names)))
+        A_matrix = np.zeros((len(names), len(names)))
 
-        for state_i in names:
-            selection = (i_state == state_i) & (j_state.isin(names)) & (nist_table["Aki(s^-1)"] != '=""')
-            selected_A = nist_table[selection]["Aki(s^-1)"].str.strip("=\"*")
-            for state_j, A in zip(j_state[selection], selected_A):
-                A_coefficients[self.states.names.index(state_i),self.states.names.index(state_j)] = float(A)
-        
-        A_coefficients[names.index("11S"), names.index("23P")] = 1.764e+02# 1.764e+02 	#3.27e-1
+        df = pandas.DataFrame({"lower_state": lower_state, "upper_state": upper_state, "A_coefficients": A_coefficients, "multiplicity": nist_table["g_i"]})
+        for (lower, upper), A in df.groupby(["lower_state", "upper_state"]):
+            weighted_A = np.average(A["A_coefficients"], weights=A["multiplicity"])
+            if lower in names and upper in names:
+                A_matrix[names.index(lower),names.index(upper)] = weighted_A
+        A_matrix[np.isnan(A_matrix)] = 0
         """
         A_coefficients[names.index("11S"), names.index("23P")] = 0# 1.764e+02 	#3.27e-1
         A_coefficients[names.index("23P"), names.index("31D")] = 0# 1.764e+02 	#3.27e-1
@@ -187,7 +186,7 @@ class RadiativeProcess:
                     continue
                 A_coefficients[states.index(state_i),states.index(state_j)] = coeff
         """
-        return A_coefficients
+        return A_matrix#A_coefficients_save#A_matrix
 
     # calculates the naural decay, arbsorbtion rate and stimulated emission rate
     def get_einstein_rates(self):
