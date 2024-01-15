@@ -19,7 +19,7 @@ import warnings
 # This is valid in the case of much higher transition rates between the ortho levels, than from either of them to the para levels
 @dataclass 
 class States:
-    names : np.array = field(default_factory=lambda: ["11S", "23S", "21S", "23P", "21P", "33S", "31S", "33P", "33D", "31D", "31P"])#, "41S", "41P", "41D", "41F"])
+    names : np.array = field(default_factory=lambda: ["11S", "23S", "21S", "23P", "21P", "33S", "31S", "33P", "33D", "31D", "31P"])#, "41S", "41P", "41D", "41F", "43s", "43P", "43D", "43F"])
     multiplicities : np.array = np.array([1, 3, 1, 9, 3, 3, 1, 9, 15, 5, 3])
     energies : np.array = np.array([0.00, 19.819614525, 20.615774823, 20.96408688908, 21.2180227112, 22.718466419, 22.920317359, 23.00707314571, 23.07365070854, 23.07407479777, 23.08701852960]) * u.eV
     ionization_species : np.array = field(default_factory=lambda: ["HeII", "HeIII"])
@@ -83,7 +83,7 @@ class Environment:
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
-        self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) 
+        self.T_electrons = self.T_phot#/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))  FIXME: this is wrong, but the paper did it wrong too
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2))
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*4*np.pi*u.Unit("erg/(s Hz sr cm2)")) 
         self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
@@ -194,8 +194,9 @@ class RadiativeProcess:
         E_diff = np.maximum(self.states.energies - self.states.energies[:,np.newaxis], 1e-5 * u.eV)
         nu = E_diff.to(u.Hz, equivalencies=u.spectral())
         const = consts.c**2 / (2 * consts.h * nu**3)
-        g_ratio = self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
+        g_ratio = self.states.multiplicities / self.states.multiplicities[:,np.newaxis]
         rho = u.sr * self.environment.spectrum(nu)
+        B = const * rho * g_ratio
         return A.value, (A * const * rho).to("1/s").value, (A * const * rho * g_ratio).T.to("1/s").value
         
 
