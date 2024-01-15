@@ -186,18 +186,17 @@ class RadiativeProcess:
                     continue
                 A_coefficients[states.index(state_i),states.index(state_j)] = coeff
         """
-        return A_matrix#A_coefficients_save#A_matrix
+        return A_matrix 
 
     # calculates the naural decay, arbsorbtion rate and stimulated emission rate
     def get_einstein_rates(self):
         A = self.get_A_rates() * u.s**-1
-        E_diff = np.maximum(self.states.energies - self.states.energies[:,np.newaxis], 1e-5 * u.eV)
+        E_diff = np.maximum(np.abs(self.states.energies - self.states.energies[:,np.newaxis]), 1e-5 * u.eV)
         nu = E_diff.to(u.Hz, equivalencies=u.spectral())
         const = consts.c**2 / (2 * consts.h * nu**3)
-        g_ratio = self.states.multiplicities / self.states.multiplicities[:,np.newaxis]
+        g_ratio = self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
         rho = u.sr * self.environment.spectrum(nu)
-        B = const * rho * g_ratio
-        return A.value, (A * const * rho).to("1/s").value, (A * const * rho * g_ratio).T.to("1/s").value
+        return A.value, (A * const * rho).T.to("1/s").value, (A * const * rho * g_ratio).to("1/s").value
         
 
     def get_transition_rate_matrix(self):
