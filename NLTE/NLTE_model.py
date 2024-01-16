@@ -83,7 +83,7 @@ class Environment:
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
-        self.T_electrons = self.T_phot#/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))  FIXME: this is wrong, but the paper did it wrong too
+        self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))  
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2))
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*4*np.pi*u.Unit("erg/(s Hz sr cm2)")) 
         self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
