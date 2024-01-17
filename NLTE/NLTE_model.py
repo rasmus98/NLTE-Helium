@@ -35,6 +35,9 @@ class States:
         self.names = np.append(self.names, name)
         self.multiplicities = np.append(self.multiplicities, multiplicity)
         self.energies = np.append(self.energies, energy)
+    
+    def get_fancy_names(self):
+        return {name: f"$1s{name[0]}{name[2].lower()}^{name[1]}{name[2]}$" for name in self.names} | {"HeII": "$He^{+}$", "HeIII": "$He^{2+}$"}
 
 # Radial density profile of the ejecta, solving the normalisation constant for a given ejecta mass
 
@@ -72,7 +75,6 @@ class Environment:
     atomic_mass: float = 4 # atomic mass of helium [u]
     photosphere_velocity: float = 0.245 # photosheric velocity as a fraction of c
     line_velocity: float = 0.245 # velocity of the region to calculate at as a fraction of c
-    #q_dot_model = lambda self, t_d: 1 * t_d**-1.3
 
     spectrum : BlackBody = None # Experienced spectrum at the ROI. Contains the doppler shifted temperature
     T_electrons: float = None # K temperature of the electrons (doppler shifted photosphere temperature)
@@ -236,7 +238,7 @@ class HotElectronIonizationProcess:
         self.states = states
         self.environment = environment
         self.w = [600, 3000] # work per ionization in eV for HeII and HeIII respectively
-        self.name = "Hot electron ionization"
+        self.name = "Non-thermal electrons"
         
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
