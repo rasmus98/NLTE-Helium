@@ -86,9 +86,14 @@ def get_density_profile(M_ej, atomic_mass, mass_fraction):
     return lambda v, t: rho(v, t, number_density_0)
 
 # Environment class, contains all the parameters of the environment at a given time and radius, the inputs to the NLTE calculation
+# The following parameters are calculated from the input parameters:
+#   - Doppler shifted temperature
+#   - Electron density
+#   - Helium density
+#   - Radiative power of non-thermal electrons
 @dataclass
 class Environment:
-    # input values
+    # input values (can be set as named parameters to the constructor)
     t_d: float = 1.43 # days. Yes Days. The second cgs unit of time, apparently.
     T_phot: float = 4400  # K
     M_ejecta: float = 0.04 # solar masses ejected
@@ -97,6 +102,7 @@ class Environment:
     photosphere_velocity: float = 0.245 # photosheric velocity as a fraction of c
     line_velocity: float = 0.245 # velocity of the region to calculate at as a fraction of c
 
+    # calculated values (Will be calculated from the input values)
     spectrum : BlackBody = None # Experienced spectrum at the ROI. Contains the doppler shifted temperature
     T_electrons: float = None # K temperature of the electrons (doppler shifted photosphere temperature)
     n_e: float = None # count/cm^3	
@@ -106,13 +112,14 @@ class Environment:
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
-        self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))  
-        W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2))
-        self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*4*np.pi*u.Unit("erg/(s Hz sr cm2)")) 
+        self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) # Doppler shifted temperature
+        W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
+        self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
         self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
         self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
-        self.q_dot = 1 * self.t_d**-1.3
+        self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
+# primary class, contains all the states and processes, and solves the system of differential equations
 class NLTESolver:
     def __init__(self, environment, states = States(), processes = None):
         self.states = states
@@ -154,44 +161,22 @@ class CollisionProcess:
     def get_collision_rates(self):
         gamma_table, temperatures = NLTE.collision_rates.get_effective_collision_strengths_table(tuple(self.states.names))
         gamma = interp1d(temperatures, gamma_table, bounds_error=True)(self.environment.T_electrons) 
-        E_diff = np.maximum(self.states.energies[:,np.newaxis] - self.states.energies, 0*u.eV)
+        E_diff = np.maximum(self.states.energies[:,np.newaxis] - self.states.energies[None,:], 0*u.eV)
         exponential = np.exp(-E_diff / (consts.k_B * self.environment.T_electrons * u.K))
-        return 8.63*10**-6/(np.sqrt(self.environment.T_electrons) * self.states.multiplicities) * gamma * exponential
+        return 8.63*10**-6/(np.sqrt(self.environment.T_electrons) * self.states.multiplicities[None,:]) * gamma * exponential
         
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         coeff_mat[:len(self.states.names), :len(self.states.names)] = self.collision_rates
-        return coeff_mat*self.environment.n_e
+        return coeff_mat*self.environment.n_e 
     
+# Handles state -> state transitions due to radiative processes (spontaneous emission, stimulated emission and absorption)
 class RadiativeProcess:
     def __init__(self, states, environment):
         self.states = states
         self.environment = environment
         self.A, self.arbsorbtion_rate, self.stimulated_emission_rate = self.get_einstein_rates()
         self.name = "Radiative"
-    """
-    # calculates the naural decay, arbsorbtion rate and stimulated emission rate
-    def get_einstein_rates(self):
-        A = get_A_rates(tuple(self.states.names)) * u.s**-1
-        E_diff = self.states.energies - self.states.energies[:,np.newaxis]
-        print(E_diff[3:6:2, 3:6:2])
-        nu = np.maximum(np.abs(E_diff.to(u.Hz, equivalencies=u.spectral())), 1 * u.Hz)
-        print(nu[3:6:2, 3:6:2])
-        const = consts.c**2 / (2 * consts.h * nu**3)
-        g_ratio = self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
-        rho = self.environment.T_phot
-        #rho = u.sr * self.environment.spectrum(nu)
-        const[E_diff <= 0] = 0
-        stimulation_rate = (A * const * rho).to("1/s").value
-        absorbtion_rate = (stimulation_rate * g_ratio).T
-        print("A")
-        print(A[3:6:2, 3:6:2])
-        print("Stimulated")
-        print(stimulation_rate[3:6:2, 3:6:2])
-        print("Absorbtion")
-        print(absorbtion_rate[3:6:2, 3:6:2])
-        return A.value, stimulation_rate, absorbtion_rate*0
-    """
 
     # calculates the naural decay, arbsorbtion rate and stimulated emission rate
     def get_einstein_rates(self):
@@ -201,19 +186,9 @@ class RadiativeProcess:
         F_nu = (2 * consts.h * nu**3) / consts.c**2
         B_stimulation = A / F_nu
         B_absorbtion = B_stimulation.T * self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
-        #print("multipliticies")
-        #print((self.states.multiplicities[:,np.newaxis] / self.states.multiplicities)[3:6:2, 3:6:2])
-
-        #rho_nu = F_nu * 1 / (np.exp(consts.h * nu / (consts.k_B * self.environment.T_phot * u.K)) - 1) * 1/2
-        rho_nu = u.sr * self.environment.spectrum(nu) / (4 * np.pi)
+        rho_nu = u.sr * self.environment.spectrum(nu)
         stimulation_rate = rho_nu * B_stimulation
         absorbtion_rate = rho_nu * B_absorbtion
-        #print("A")
-        #print(A[3:6:2, 3:6:2])
-        #print("Stimulated")
-        #print(stimulation_rate[3:6:2, 3:6:2])
-        #print("Absorbtion")
-        #print(absorbtion_rate[3:6:2, 3:6:2])
         return A.to("1/s").value, stimulation_rate.to("1/s").value, absorbtion_rate.to("1/s").value
         
 
@@ -222,6 +197,7 @@ class RadiativeProcess:
         coeff_mat[:len(self.states.names), :len(self.states.names)] = self.A + self.arbsorbtion_rate + self.stimulated_emission_rate
         return coeff_mat
     
+# Handles state -> state transitions due to photoionization
 class PhotoionizationProcess:
     def __init__(self, states, environment):
         self.states = states
@@ -244,8 +220,8 @@ class RecombinationProcess:
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         names = self.states.all_names
-        coeff_mat[names.index("23S"), names.index("HeII")] = self.alpha[0] * self.environment.n_e * 0.75
-        coeff_mat[names.index("21S"), names.index("HeII")] = self.alpha[0] * self.environment.n_e * 0.25
+        coeff_mat[names.index("23S"), names.index("HeII")] = self.alpha[0] * self.environment.n_e * 0.75 
+        coeff_mat[names.index("21S"), names.index("HeII")] = self.alpha[0] * self.environment.n_e * 0.25 
         coeff_mat[names.index("HeII"), names.index("HeIII")] = self.alpha[1] * self.environment.n_e
         return coeff_mat
     
@@ -253,17 +229,17 @@ class HotElectronIonizationProcess:
     def __init__(self, states, environment):
         self.states = states
         self.environment = environment
-        self.w = [600, 3000] # work per ionization in eV for HeII and HeIII respectively
+        self.w = [593, 3076] # work per ionization in eV for HeII and HeIII respectively
         self.name = "Non-thermal electrons"
         
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         names = self.states.all_names
         # TODO: fix back
-        coeff_mat[names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0]
-       # coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
+        coeff_mat[names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0] 
+        # coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
         coeff_mat[names.index("HeIII"), names.index("HeII")] = self.environment.q_dot / self.w[1]
-        return coeff_mat
+        return coeff_mat 
 
     
 @lru_cache
@@ -299,7 +275,7 @@ def get_ionization_rates(states, spectrum):
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             ionization_flux_article = u.sr * sigma * (spectrum(nu)/E)
         ionization_rates.append(np.trapz(x=nu, y=ionization_flux_article).to(1/u.s).value) 
-    return np.array(ionization_rates)
+    return np.array(ionization_rates) * 16 * np.pi # TODO find out why the 16*pi is needed
 
 # Calculate recombination coefficients
 def calculate_alpha_coefficients(T):   
