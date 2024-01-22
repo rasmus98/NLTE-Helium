@@ -125,7 +125,11 @@ def get_effective_collision_strengths_table(state_list):
     gamma_table, species, temperatures = read_effective_collision_strengths_table()
     missing_states = np.setdiff1d(state_list, species)
     if len(missing_states) > 0:
-        print("Error: missing states in collision table: ", missing_states)
+        print("Warning: missing states in collision table: ", missing_states)
+        print("Inserting ones for missing states")
+        padded_gamma_table = np.ones([gamma_table.shape[0] + len(missing_states)]*2 + [len(temperatures)])
+        padded_gamma_table[:gamma_table.shape[0], :gamma_table.shape[1], :] = gamma_table
+        gamma_table = padded_gamma_table
+        species = species + list(missing_states)
     state_indices = [species.index(state) for state in state_list]
-    gamma_table = gamma_table[state_indices, :, :][:, state_indices, :]
-    return gamma_table, temperatures
+    return gamma_table[state_indices, :, :][:, state_indices, :], temperatures

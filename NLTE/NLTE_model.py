@@ -37,7 +37,28 @@ class States:
         self.energies = np.append(self.energies, energy)
     
     def get_fancy_names(self):
-        return {name: f"$1s{name[0]}{name[2].lower()}^{name[1]}{name[2]}$" for name in self.names} | {"HeII": "$He^{+}$", "HeIII": "$He^{2+}$"}
+        return {name: f"$1s{name[0:-2]}{name[-1].lower()}^{name[-2]}{name[-1]}$" for name in self.names} | {"HeII": "$He^{+}$", "HeIII": "$He^{2+}$"}
+    
+    @staticmethod
+    def read_states(filter = lambda table: table["n"] <= 4):
+        nist_table = pandas.read_csv("atomic data/levels_nist.csv", delimiter=r",", usecols=lambda x: x not in ["Prefix", "Suffix"], dtype=str)
+        nist_table = nist_table.apply(lambda x: x.str.removeprefix("=\"").str.removesuffix("\""), axis=1)
+        nist_table = nist_table.dropna(subset=['g']) # drop the 
+        for col in nist_table.columns:
+            nist_table[col] = nist_table[col].str.removeprefix("=\"").str.removesuffix("\"")
+            if col in ["Level (eV)", "Uncertainty (eV)"]:
+                nist_table[col] = pandas.to_numeric(nist_table[col])
+            if col in ["j", "g"]:
+                nist_table[col] = pandas.to_numeric(nist_table[col])
+        nist_table = nist_table[nist_table["Level (eV)"] < 30]
+        nist_table["n"] = nist_table["Configuration"].str.split(".").apply(lambda x: sum(int(re.match("(\d+)(\w)(2?)", y).group(1))-1 for y in x)+1)
+
+        nist_table["name"] = nist_table["n"].astype(str) + nist_table["Term"].str.replace("*", "")
+        #for i, row in nist_table[nist_table["n"] <= 4].iterrows():
+            #print(row)
+        states = nist_table.groupby("name").agg({"Level (eV)": "min", "n": "min", "g" : "sum"}).sort_values("Level (eV)")
+        selected_states = states[filter(states)]
+        return States(list(selected_states.index.values), selected_states["g"].values, selected_states["Level (eV)"].values * u.eV)
 
 # Radial density profile of the ejecta, solving the normalisation constant for a given ejecta mass
 
@@ -148,57 +169,52 @@ class RadiativeProcess:
         self.environment = environment
         self.A, self.arbsorbtion_rate, self.stimulated_emission_rate = self.get_einstein_rates()
         self.name = "Radiative"
-
-            
-    def get_A_rates(self):
-        get_n = lambda n, l, count: (int(n)-1)*2 if count else (int(n)-1)
-        nist_table = pandas.read_csv("atomic data/A_rates_NIST.csv")
-        def get_state_name(config_series, term_series):
-            n = config_series.str.findall("([\d+]+)([spdf])(2?)").apply(lambda x: str(1+sum([get_n(*nlm) for nlm in x])))
-            term = term_series.str.strip("=\"*")
-            return n+term
-
-        lower_state = get_state_name(nist_table["conf_i"], nist_table["term_i"])
-        upper_state = get_state_name(nist_table["conf_k"], nist_table["term_k"])
-        A_coefficients = pandas.to_numeric(nist_table["Aki(s^-1)"].str.strip("=\"*"))
-        names = self.states.names
-        A_matrix = np.zeros((len(names), len(names)))
-
-        df = pandas.DataFrame({"lower_state": lower_state, "upper_state": upper_state, "A_coefficients": A_coefficients, "multiplicity": nist_table["g_i"]})
-        for (lower, upper), A in df.groupby(["lower_state", "upper_state"]):
-            weighted_A = np.average(A["A_coefficients"], weights=A["multiplicity"])
-            if lower in names and upper in names:
-                A_matrix[names.index(lower),names.index(upper)] = weighted_A
-        A_matrix[np.isnan(A_matrix)] = 0
-        """
-        A_coefficients[names.index("11S"), names.index("23P")] = 0# 1.764e+02 	#3.27e-1
-        A_coefficients[names.index("23P"), names.index("31D")] = 0# 1.764e+02 	#3.27e-1
-        A_coefficients[names.index("21P"), names.index("33D")] = 0# 1.764e+02 	#3.27e-1
-        A_coefficients[names.index("21P"), names.index("23S")] = 0# 1.764e+02 	#3.27e-1
-        A_coefficients[names.index("31D"), names.index("33P")] = 0# 1.764e+02 	#3.27e-1
-        """
-        """
-        # F. Drake 1969
-        drake_coeff = {"11S": {"21S": 5.13e1}}#, "23S": 4.02e-9}}
-        for state_i, subtable in drake_coeff.items():
-            if state_i not in states:
-                continue
-            for state_j, coeff in subtable.items():
-                if state_j not in states:
-                    continue
-                A_coefficients[states.index(state_i),states.index(state_j)] = coeff
-        """
-        return A_matrix 
+    """
+    # calculates the naural decay, arbsorbtion rate and stimulated emission rate
+    def get_einstein_rates(self):
+        A = get_A_rates(tuple(self.states.names)) * u.s**-1
+        E_diff = self.states.energies - self.states.energies[:,np.newaxis]
+        print(E_diff[3:6:2, 3:6:2])
+        nu = np.maximum(np.abs(E_diff.to(u.Hz, equivalencies=u.spectral())), 1 * u.Hz)
+        print(nu[3:6:2, 3:6:2])
+        const = consts.c**2 / (2 * consts.h * nu**3)
+        g_ratio = self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
+        rho = self.environment.T_phot
+        #rho = u.sr * self.environment.spectrum(nu)
+        const[E_diff <= 0] = 0
+        stimulation_rate = (A * const * rho).to("1/s").value
+        absorbtion_rate = (stimulation_rate * g_ratio).T
+        print("A")
+        print(A[3:6:2, 3:6:2])
+        print("Stimulated")
+        print(stimulation_rate[3:6:2, 3:6:2])
+        print("Absorbtion")
+        print(absorbtion_rate[3:6:2, 3:6:2])
+        return A.value, stimulation_rate, absorbtion_rate*0
+    """
 
     # calculates the naural decay, arbsorbtion rate and stimulated emission rate
     def get_einstein_rates(self):
-        A = self.get_A_rates() * u.s**-1
-        E_diff = np.maximum(np.abs(self.states.energies - self.states.energies[:,np.newaxis]), 1e-5 * u.eV)
-        nu = E_diff.to(u.Hz, equivalencies=u.spectral())
-        const = consts.c**2 / (2 * consts.h * nu**3)
-        g_ratio = self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
-        rho = u.sr * self.environment.spectrum(nu)
-        return A.value, (A * const * rho).T.to("1/s").value, (A * const * rho * g_ratio).to("1/s").value
+        A = get_A_rates(tuple(self.states.names)) * u.s**-1
+        E_diff = self.states.energies - self.states.energies[:,np.newaxis]
+        nu = np.maximum(np.abs(E_diff.to(u.Hz, equivalencies=u.spectral())), 1 * u.Hz)
+        F_nu = (2 * consts.h * nu**3) / consts.c**2
+        B_stimulation = A / F_nu
+        B_absorbtion = B_stimulation.T * self.states.multiplicities[:,np.newaxis] / self.states.multiplicities
+        #print("multipliticies")
+        #print((self.states.multiplicities[:,np.newaxis] / self.states.multiplicities)[3:6:2, 3:6:2])
+
+        #rho_nu = F_nu * 1 / (np.exp(consts.h * nu / (consts.k_B * self.environment.T_phot * u.K)) - 1) * 1/2
+        rho_nu = u.sr * self.environment.spectrum(nu) / (4 * np.pi)
+        stimulation_rate = rho_nu * B_stimulation
+        absorbtion_rate = rho_nu * B_absorbtion
+        #print("A")
+        #print(A[3:6:2, 3:6:2])
+        #print("Stimulated")
+        #print(stimulation_rate[3:6:2, 3:6:2])
+        #print("Absorbtion")
+        #print(absorbtion_rate[3:6:2, 3:6:2])
+        return A.to("1/s").value, stimulation_rate.to("1/s").value, absorbtion_rate.to("1/s").value
         
 
     def get_transition_rate_matrix(self):
@@ -264,7 +280,7 @@ def get_ionization_dict():
         n = n_symetry + orbital_l
         if orbital_l == 0 and spin_multiplicity == 3:
             n = n + 1 # because the 13s state does not exist, the 23s is first in the symmetry
-        l = "SPDFABCD"[orbital_l]
+        l = "SPDFGHIK"[orbital_l]
         state = str(n) + str(spin_multiplicity) + l
         (energies, cross) = np.loadtxt(io.StringIO(content), unpack=True)
         if len(energies) > 0:
@@ -285,7 +301,6 @@ def get_ionization_rates(states, spectrum):
         ionization_rates.append(np.trapz(x=nu, y=ionization_flux_article).to(1/u.s).value) 
     return np.array(ionization_rates)
 
-
 # Calculate recombination coefficients
 def calculate_alpha_coefficients(T):   
     T_list = [3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0]
@@ -293,3 +308,31 @@ def calculate_alpha_coefficients(T):
     alpha_HeIII = [9.73e-12, 8.42e-12, 7.28e-12, 6.28e-12, 5.42e-12, 4.67e-12, 4.02e-12, 3.46e-12, 2.96e-12, 2.55e-12, 2.18e-12]
 
     return interp1d(T_list, [alpha_HeII, alpha_HeIII])( np.log10(T) )
+
+@lru_cache
+def get_A_table():
+    get_n = lambda n, l, count: (int(n)-1)*2 if count else (int(n)-1)
+    nist_table = pandas.read_csv("atomic data/A_rates_NIST.csv", dtype=str)
+    nist_table = nist_table.apply(lambda x: x.str.removeprefix("=\"").str.removesuffix("\"") if x.dtype == object else x, axis=1)
+    nist_table = nist_table[(nist_table['Aki(s^-1)'] != "")] # drop lines of no interest
+
+    def get_state_name(config_series, term_series):
+        n = config_series.str.findall("(\d+)(\w)(2?)").apply(lambda x: str(1+sum([get_n(*nlm) for nlm in x])))
+        return n+term_series.str.replace("*", "")
+
+    nist_table["lower_name"] = get_state_name(nist_table["conf_i"], nist_table["term_i"])
+    nist_table["upper_name"] = get_state_name(nist_table["conf_k"], nist_table["term_k"])
+    nist_table["A_rates"] = pandas.to_numeric(nist_table["Aki(s^-1)"])
+    nist_table["g_k"] = pandas.to_numeric(nist_table["g_k"])
+    return nist_table
+
+@lru_cache
+def get_A_rates(names):
+    nist_table = NLTE.NLTE_model.get_A_table()
+    A_coefficients = np.zeros((len(names), len(names)))
+    for (lower_name, upper_name), subtable in nist_table.groupby(["lower_name", "upper_name"]):
+        if not (lower_name in names and upper_name in names):
+            continue
+        weighted_A = np.average(subtable["A_rates"], weights=subtable["g_k"])
+        A_coefficients[names.index(lower_name),names.index(upper_name)] = weighted_A
+    return A_coefficients
