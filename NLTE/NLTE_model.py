@@ -6,7 +6,7 @@ import astropy.constants as consts
 from astropy.modeling.physical_models import BlackBody
 from dataclasses import dataclass, field
 from scipy.integrate import quad, solve_ivp
-from functools import lru_cache
+from functools import lru_cache, partial
 import NLTE.collision_rates
 import io 
 import re
@@ -112,6 +112,7 @@ class Environment:
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
+        # commenting out the dopler shift reproduce Tarumi's results
         self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) # Doppler shifted temperature
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
@@ -138,15 +139,15 @@ class NLTESolver:
 
     def solve(self, times):        
         rate_matrix = self.get_transition_rate_matrix()
-        np.fill_diagonal(rate_matrix, -np.sum(rate_matrix, axis=0))
+        np.fill_diagonal(rate_matrix, -np.sum(rate_matrix, axis=0) + np.diag(rate_matrix))
         initial = np.ones(len(self.states.all_names)) / len(self.states.all_names)
         diff_eq = lambda t, n: rate_matrix@n
         if isinstance(times, np.ndarray):
             solution = solve_ivp(diff_eq, (0, max(times)), 
-                             initial, t_eval=times, method="LSODA",  rtol=1e-6, atol=1e-40)
+                             initial, t_eval=times, method="LSODA",  rtol=1e-8, atol=1e-40)
         else:   
             solution = solve_ivp(diff_eq, (0, times), 
-                                 initial, method="LSODA",  rtol=1e-6, atol=1e-40)
+                                 initial, method="LSODA",  rtol=1e-8, atol=1e-40)
         return solution.t, solution.y * self.environment.n_He
         
 
@@ -156,6 +157,7 @@ class CollisionProcess:
         self.states = states
         self.environment = environment
         self.collision_rates = self.get_collision_rates()
+        #self.collision_rates = get_collision_strengths(tuple(self.states.names), self.environment.T_electrons * u.K) #self.get_collision_rates()
         self.name = "Collision"
         
     def get_collision_rates(self):
@@ -275,7 +277,7 @@ def get_ionization_rates(states, spectrum):
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             ionization_flux_article = u.sr * sigma * (spectrum(nu)/E)
         ionization_rates.append(np.trapz(x=nu, y=ionization_flux_article).to(1/u.s).value) 
-    return np.array(ionization_rates) * 16 * np.pi # TODO find out why the 16*pi is needed
+    return np.array(ionization_rates) * 4 * np.pi # TODO find out why the 16*pi is needed
 
 # Calculate recombination coefficients
 def calculate_alpha_coefficients(T):   
@@ -300,15 +302,63 @@ def get_A_table():
     nist_table["upper_name"] = get_state_name(nist_table["conf_k"], nist_table["term_k"])
     nist_table["A_rates"] = pandas.to_numeric(nist_table["Aki(s^-1)"])
     nist_table["g_k"] = pandas.to_numeric(nist_table["g_k"])
+    nist_table["g_i"] = pandas.to_numeric(nist_table["g_i"])
     return nist_table
 
 @lru_cache
 def get_A_rates(names):
     nist_table = NLTE.NLTE_model.get_A_table()
     A_coefficients = np.zeros((len(names), len(names)))
-    for (lower_name, upper_name), subtable in nist_table.groupby(["lower_name", "upper_name"]):
+    for (lower_name, upper_name, _), subtable in nist_table.groupby(["lower_name", "upper_name", "J_i"]):
         if not (lower_name in names and upper_name in names):
             continue
-        weighted_A = np.average(subtable["A_rates"], weights=subtable["g_k"])
-        A_coefficients[names.index(lower_name),names.index(upper_name)] = weighted_A
+
+        weighted_A = np.average(subtable["A_rates"], weights = subtable["g_k"])
+        A_coefficients[names.index(lower_name),names.index(upper_name)] += weighted_A
     return A_coefficients
+
+@lru_cache()
+def load_cross_sections():
+    all_states = NLTE.NLTE_model.States.read_states(lambda table: (table["n"] <= 4))
+    get_E = lambda name: all_states.energies[all_states.names.index(name)]
+    get_g = lambda name: all_states.multiplicities[all_states.names.index(name)]
+
+    def get_cross_sections(filename, fit_function):
+        table = pandas.read_csv(filename, skiprows=6, skipfooter=5, engine="python", sep="\s+", index_col=[0,1], header=None, skip_blank_lines=True)
+        clamped_fit_function = lambda E, A, i, f: np.where(E>get_E(f) - get_E(i), fit_function(E/(get_E(f) - get_E(i)), A), 0) * np.pi * consts.a0**2 * u.Ry / (get_g(i) * E)
+        return {(i,f): partial(clamped_fit_function, A=A, i = i, f=f) for (i,f), A in table.T.to_dict("list").items()}
+
+    sigmas = get_cross_sections("atomic data/dipole-allowed.csv",    lambda x, A: (A[0]*np.log(x) + A[1] + A[2]/x + A[3]/x**2 + A[4]/x**3)*(x+1)/(x+A[5]))\
+        | get_cross_sections("atomic data/dipole-forbidden.csv", lambda x, A: (A[0] + A[1]/x + A[2]/x**2 + A[3]/x**3)*(x**2)/(x**2+A[4]))\
+        | get_cross_sections("atomic data/spin-forbidden.csv",   lambda x, A: (A[0] + A[1]/x + A[2]/x**2 + A[3]/x**3)*(1)/(x**2+A[4]))
+    return sigmas
+
+# Returns the collision strenths, which should be mutliplied with the electron density to get the rates
+@lru_cache()
+def get_collision_strengths(select_state_names, T):
+    all_states = NLTE.NLTE_model.States.read_states(lambda table: (table["n"] <= 4))
+    get_E = lambda name: all_states.energies[all_states.names.index(name)]
+    get_g = lambda name: all_states.multiplicities[all_states.names.index(name)]
+    sigmas = load_cross_sections()
+    electron_v_distibution = lambda v: (consts.m_e /(2*np.pi*consts.k_B * T))**(3/2) * 4* np.pi * v**2 * np.exp(-consts.m_e * v**2 /(2*consts.k_B * T))
+    v_to_E = lambda v: 1/2 * consts.m_e * v**2
+    integrand = lambda v, sigma: electron_v_distibution(v) * v * sigma(v_to_E(v))
+    E_range = np.geomspace(1e-7, 1e5, 10000) * u.eV
+    v_range = np.sqrt(2*E_range/consts.m_e)
+    index = list(select_state_names)
+    collision_strengths = np.zeros((len(index), len(index)))
+    for (i,f), sigma in sigmas.items(): 
+        if i not in index or f not in index:
+            continue
+        # these are excitations, so i is the lower state and f is the upper state
+        # rate_matrix[i,f] on the other hand is the rate from f to i
+        i_index = index.index(i)
+        f_index = index.index(f)
+        rate = np.trapz(integrand(v_range, sigma), v_range).to(u.cm**3/u.s).value
+        collision_strengths[f_index, i_index] = rate
+        # Calculate the deexcitation rate from f to i
+        # Easier to come down if lower multiplicity is lower, and if the energy difference greater
+        w_ratio =  get_g(i) / get_g(f)
+        delta_E = get_E(f) - get_E(i)
+        collision_strengths[i_index, f_index] = rate * w_ratio * np.exp(delta_E/(consts.k_B* T))
+    return collision_strengths
