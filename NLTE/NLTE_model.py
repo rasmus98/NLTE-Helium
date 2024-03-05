@@ -216,15 +216,16 @@ class RecombinationProcess:
     def __init__(self, states, environment):
         self.states = states
         self.environment = environment
-        self.alpha = calculate_alpha_coefficients(environment.T_electrons)
+        self.alphaHI = get_HI_recombination_funcs(tuple(states.names))
+        self.alphaHII = get_HII_recombination_func()
         self.name = "Recombination"
 
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
-        names = self.states.all_names
-        coeff_mat[names.index("23S"), names.index("HeII")] = self.alpha[0] * self.environment.n_e * 0.75 
-        coeff_mat[names.index("21S"), names.index("HeII")] = self.alpha[0] * self.environment.n_e * 0.25 
-        coeff_mat[names.index("HeII"), names.index("HeIII")] = self.alpha[1] * self.environment.n_e
+        T = self.environment.T_electrons
+        for name, func in self.alphaHI.items():
+            coeff_mat[self.states.all_names.index(name), self.states.all_names.index("HeII")] = func(np.log10(T)) * self.environment.n_e
+        coeff_mat[self.states.all_names.index("HeII"), self.states.all_names.index("HeIII")] = self.alphaHII(np.log10(T)) * self.environment.n_e
         return coeff_mat
     
 class HotElectronIonizationProcess:
@@ -278,14 +279,6 @@ def get_ionization_rates(states, spectrum):
             ionization_flux_article = u.sr * sigma * (spectrum(nu)/E)
         ionization_rates.append(np.trapz(x=nu, y=ionization_flux_article).to(1/u.s).value) 
     return np.array(ionization_rates) * 4 * np.pi # TODO find out why the 16*pi is needed
-
-# Calculate recombination coefficients
-def calculate_alpha_coefficients(T):   
-    T_list = [3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0]
-    alpha_HeII = [1.99e-12, 1.71e-12, 1.47e-12, 1.27e-12, 1.09e-12, 9.32e-13, 7.98e-13, 6.84e-13, 5.85e-13, 5.00e-13, 4.28e-13]
-    alpha_HeIII = [9.73e-12, 8.42e-12, 7.28e-12, 6.28e-12, 5.42e-12, 4.67e-12, 4.02e-12, 3.46e-12, 2.96e-12, 2.55e-12, 2.18e-12]
-
-    return interp1d(T_list, [alpha_HeII, alpha_HeIII])( np.log10(T) )
 
 @lru_cache
 def get_A_table():
@@ -362,3 +355,43 @@ def get_collision_strengths(select_state_names, T):
         delta_E = get_E(f) - get_E(i)
         collision_strengths[i_index, f_index] = rate * w_ratio * np.exp(delta_E/(consts.k_B* T))
     return collision_strengths
+
+# Calculate recombination coefficients
+@lru_cache()
+def get_HII_recombination_func():   
+    return interp1d([3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0], 
+                    [9.73e-12, 8.42e-12, 7.28e-12, 6.28e-12, 5.42e-12, 4.67e-12, 4.02e-12, 3.46e-12, 2.96e-12, 2.55e-12, 2.18e-12])
+
+# Returns the collision strenths, which should be mutliplied with the electron density to get the rates
+@lru_cache()
+def get_HI_recombination_funcs(select_state_names):
+    T, recombination_dict, total_recomb_rate = read_recombination_data()
+    subset_dict = {name: data for name, data in recombination_dict.items() if name in select_state_names and name != "11S"}
+    subset_sum = sum(subset_dict.values(), T*0)
+    ground_coeff = recombination_dict["11S"]
+    normalization_coeff = (total_recomb_rate - ground_coeff) / subset_sum
+    renormalized_dict = {name: interp1d(np.log10(T), data * normalization_coeff) for name, data in subset_dict.items() }
+    renormalized_dict["11S"] = interp1d(np.log10(T), ground_coeff)
+    return renormalized_dict
+
+def read_recombination_data():
+    with open("atomic data/he1.rrc.ls.txt") as recomb_data:
+        filecontent = recomb_data.readlines()
+    
+    T = np.array(list(map(float,"".join(filecontent[298:312]).strip().replace("(Ry)",  "").replace("(K)", "").replace("\n", "").split())))
+
+    coeff_filecontent = "".join(filecontent[314:])
+    exp_number_format = r"[-+]?\d\.\d+E[+-]\d{2}"
+    recombination_dict = {}
+    for statelabel, title, data in re.findall(f"(?:(\d{{8}}\.\d{{4}}) {exp_number_format}|(.*)=)\s+((?:{exp_number_format}\s+)+)", coeff_filecontent):
+        recombination_rates = np.array(list(map(float, data.strip().split())))
+        if statelabel:
+            n = int(statelabel[-4:-2])
+            n = max(1,n) # for some fucking reason the ground state is n=0, but the first exited is n=2
+            l = int(statelabel[-2])
+            label = f"{n}{statelabel[0]}{'SPDFGHIK'[l]}"
+            recombination_dict[label] = recombination_rates
+        else:
+            if title == "with dr rc added, net total":
+                total_recomb_rate = recombination_rates
+    return T, recombination_dict, total_recomb_rate
