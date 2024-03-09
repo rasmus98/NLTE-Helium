@@ -1,2 +1,2 @@
-This folder contains the code for examining the viability of a NLTE He\,{\sc i}\,$\lambda$1083.3\,nm line producing the observed optically thick 1$\mu$m P Cygni feature in the kilonova AT2017gfo. 
-It details a full collisional-radiative model of helium, which is deliberated in the paper "...". 
+This folder contains the code for examining the viability of a NLTE He I 1083.3 nm line producing the observed optically thick 1 micron P Cygni feature in the kilonova AT2017gfo. 
+It details a full collisional-radiative model of helium, which is deliberated in the paper "..." - and which is a further development of the model presented in Tarumi et al (2023), "Non-LTE analysis for Helium and Strontium lines in the kilonova AT2017gfo". 
