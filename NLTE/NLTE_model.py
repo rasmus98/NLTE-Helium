@@ -120,6 +120,45 @@ class Environment:
         self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
+# Solves the NLTE equations for the given environment and states
+# The solver uses the sobolev depth method to solve the NLTE equations
+# Iteration works follows:
+# First the NLTE equations are solved assuming optically thin conditions, 
+# then the sobolev depth is calculated, the transition rates are adjusted, and the NLTE equations are solved again
+# These are 
+def solve_NLTE_sob(environment, states, relaxation_steps = 5): 
+    nlte_solver = NLTE.NLTE_model.NLTESolver(environment, states=states)
+    radiative_process = nlte_solver.processes[1]
+    # save the original rates
+    A = radiative_process.A 
+    absorbtion_rate = radiative_process.arbsorbtion_rate
+    stimulated_emission_rate = radiative_process.stimulated_emission_rate
+
+    # perform a few relaxation steps to get the correct sobolev depth
+    for _ in range(relaxation_steps):
+        _, y = nlte_solver.solve(1e6)
+        n = y.T[-1,:-2] * u.cm**-3
+        eps0 = 1/(4 * np.pi) # i dont like gauss units
+        tau = np.zeros((len(n), len(n)))
+        # The sobolev depth is calculated individually for each transition
+        # Yes i know, loop, very inefficient, but this is a small matrix
+        for i in range(len(n)): 
+            for j in range(len(n)):
+                dE = states.energies[j] - states.energies[i]
+                if dE <= 0:
+                    continue
+                lam = dE.to("cm", equivalencies=u.spectral())
+                tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * environment.t_d * u.day
+        # calculate optical depth and escape probability        
+        tau = np.maximum(tau,tau.T)+1e-8
+        beta = np.array((1-np.exp(-tau)) / tau)
+        # adjust the transition rates
+        radiative_process.A = A * beta
+        radiative_process.arbsorbtion_rate = absorbtion_rate * beta
+        radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
+    return nlte_solver.solve(1e6)[1][:,-1], nlte_solver
+        
+
 # primary class, contains all the states and processes, and solves the system of differential equations
 class NLTESolver:
     def __init__(self, environment, states = States(), processes = None):
