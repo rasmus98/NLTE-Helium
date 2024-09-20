@@ -27,6 +27,14 @@ class States:
     def __post_init__(self):
         self.all_names = self.names + self.ionization_species
 
+    def __hash__(self):
+        return hash(tuple(self.names))
+    
+    def __eq__(self, __value: object) -> bool:
+        return self.names == __value.names and \
+        (self.multiplicities == __value.multiplicities).all() and \
+        (self.energies == __value.energies).all()
+
     def filter(self, names):
         mask = np.isin(self.names, names)
         return States(list(np.array(self.names)[mask]), self.multiplicities[mask], self.energies[mask])
@@ -196,20 +204,22 @@ class CollisionProcess:
         self.states = states
         self.environment = environment
         self.collision_rates = self.get_collision_rates()
-        #self.collision_rates = get_collision_strengths(tuple(self.states.names), self.environment.T_electrons * u.K) #self.get_collision_rates()
         self.name = "Collision"
         
     def get_collision_rates(self):
-        gamma_table, temperatures = NLTE.collision_rates.get_effective_collision_strengths_table(tuple(self.states.names))
+        gamma_table, temperatures = NLTE.collision_rates.get_effective_collision_strengths_table_Kington(tuple(self.states.names))
         gamma = interp1d(temperatures, gamma_table, bounds_error=True)(self.environment.T_electrons) 
-        E_diff = np.maximum(self.states.energies[:,np.newaxis] - self.states.energies[None,:], 0*u.eV)
-        exponential = np.exp(-E_diff / (consts.k_B * self.environment.T_electrons * u.K))
+        E_diff = self.states.energies[:,np.newaxis] - self.states.energies[None,:]
+        exponential = np.exp(-np.maximum(E_diff, 0*u.eV) / (consts.k_B * self.environment.T_electrons * u.K))
         return 8.63*10**-6/(np.sqrt(self.environment.T_electrons) * self.states.multiplicities[None,:]) * gamma * exponential
         
-    def get_transition_rate_matrix(self):
+    def get_transition_rate_matrix_Kingston(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         coeff_mat[:len(self.states.names), :len(self.states.names)] = self.collision_rates
         return coeff_mat*self.environment.n_e 
+    
+    def get_transition_rate_matrix(self):
+        return NLTE.collision_rates.get_collision_rates_Ralchenko(self.states, self.environment.T_electrons)*self.environment.n_e 
     
 # Handles state -> state transitions due to radiative processes (spontaneous emission, stimulated emission and absorption)
 class RadiativeProcess:

@@ -1,7 +1,10 @@
-from functools import lru_cache
+from functools import lru_cache, partial
 import numpy as np
 import pandas as pd
 import re
+import astropy.units as u
+import astropy.constants as const
+
 
 @lru_cache
 def read_effective_collision_strengths_table():
@@ -45,7 +48,7 @@ def read_effective_collision_strengths_table():
 # rewrites the columns and rows to be in the order of the state_list, and inserts zeros for missing values (if any)
 # in return for a warning
 @lru_cache
-def get_effective_collision_strengths_table(state_list):
+def get_effective_collision_strengths_table_Kington(state_list):
     gamma_table, species, temperatures = read_effective_collision_strengths_table()
     missing_states = np.setdiff1d(state_list, species)
     if len(missing_states) > 0:
@@ -57,3 +60,50 @@ def get_effective_collision_strengths_table(state_list):
         species = species + list(missing_states)
     state_indices = [species.index(state) for state in state_list]
     return gamma_table[state_indices, :, :][:, state_indices, :], temperatures
+
+@lru_cache
+def get_sigmas(states):
+    get_E = lambda name: states.energies[states.names.index(name)]
+    get_g = lambda name: states.multiplicities[states.names.index(name)]
+    def get_cross_sections(filename, fit_function):
+        table = pd.read_csv(filename, skiprows=6, skipfooter=5, engine="python", sep="\s+", index_col=[0,1], header=None, skip_blank_lines=True)
+        clamped_fit_function = lambda E, A, i, f: np.where(E>get_E(f) - get_E(i), fit_function(E/(get_E(f) - get_E(i)), A), 0) * np.pi * const.a0**2 * u.Ry / (get_g(i) * E)
+        return {(i,f): partial(clamped_fit_function, A=A, i = i, f=f) for (i,f), A in table.T.to_dict("list").items()}
+
+    # Load all transitions as a dictionary (lower, upper) : crossection(E)
+    return get_cross_sections("atomic data/dipole-allowed.csv",    lambda x, A: (A[0]*np.log(x) + A[1] + A[2]/x + A[3]/x**2 + A[4]/x**3)*(x+1)/(x+A[5]))\
+         | get_cross_sections("atomic data/dipole-forbidden.csv", lambda x, A: (A[0] + A[1]/x + A[2]/x**2 + A[3]/x**3)*(x**2)/(x**2+A[4]))\
+         | get_cross_sections("atomic data/spin-forbidden.csv",   lambda x, A: (A[0] + A[1]/x + A[2]/x**2 + A[3]/x**3)*(1)/(x**2+A[4]))
+
+
+@lru_cache
+def get_collision_rates_Ralchenko(states, T):
+    T = T * u.K
+    T_ev = T.to(u.eV, equivalencies=u.temperature_energy())
+
+    get_E = lambda name: states.energies[states.names.index(name)]
+    get_g = lambda name: states.multiplicities[states.names.index(name)]
+
+    electron_v_distibution = lambda v: (const.m_e /(2*np.pi*const.k_B * T))**(3/2) * 4* np.pi * v**2 * np.exp(-const.m_e * v**2 /(2*const.k_B * T))
+    sigmas = get_sigmas(states)
+    v_to_E = lambda v: 1/2 * const.m_e * v**2
+    integrand = lambda v, sigma: electron_v_distibution(v) * v * sigma(v_to_E(v))
+
+    rate_matrix = np.zeros((len(states.all_names), len(states.all_names)))
+    for (lower,upper), sigma in sigmas.items(): 
+        if lower not in states.names or upper not in states.names:
+            continue
+        # calculate excitations rates:
+        lower_index = states.names.index(lower)
+        upper_index = states.names.index(upper)
+        w_ratio =  get_g(lower) / get_g(upper)
+        delta_E = get_E(lower)- get_E(upper)
+
+        E_range = np.geomspace(-delta_E.to(u.eV).value, T_ev.value*1e2, 1000) * u.eV
+        v_range = np.sqrt(2*E_range/const.m_e)
+        rate = np.trapz(integrand(v_range, sigma), v_range).cgs.value
+        rate_matrix[upper_index, lower_index] = rate
+        # then canculate inverse deexcitation rates
+        # Easier to come down if lower multiplicity is higher, and if the energy difference greater
+        rate_matrix[lower_index, upper_index] = rate * w_ratio * np.exp(-(delta_E/(const.k_B* T)).cgs.value)
+    return rate_matrix
