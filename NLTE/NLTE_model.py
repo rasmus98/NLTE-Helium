@@ -136,12 +136,14 @@ class Environment:
 # These are 
 def solve_NLTE_sob(environment, states, relaxation_steps = 5): 
     nlte_solver = NLTE.NLTE_model.NLTESolver(environment, states=states)
-    radiative_process = nlte_solver.processes[1]
+    get_process = lambda solver, process: [p for p in solver.processes if isinstance(p, process)][0]
+    radiative_process = get_process(nlte_solver, RadiativeProcess)
     # save the original rates
     A = radiative_process.A 
     absorbtion_rate = radiative_process.arbsorbtion_rate
     stimulated_emission_rate = radiative_process.stimulated_emission_rate
-
+    # the "escape probability" accounting for self absorption
+    beta = 99.9 # purposely initialize to a ridiculous value; beta is always <= 1
     # perform a few relaxation steps to get the correct sobolev depth
     for _ in range(relaxation_steps):
         _, y = nlte_solver.solve(1e6)
@@ -156,10 +158,10 @@ def solve_NLTE_sob(environment, states, relaxation_steps = 5):
                 if dE <= 0:
                     continue
                 lam = dE.to("cm", equivalencies=u.spectral())
-                tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * environment.t_d * u.day
+                tau[i,j] = lam**3*eps0 * radiative_process.A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * environment.t_d * u.day
         # calculate optical depth and escape probability        
         tau = np.maximum(tau,tau.T)+1e-8
-        beta = np.array((1-np.exp(-tau)) / tau)
+        beta = np.minimum(beta, np.array((1-np.exp(-tau)) / tau))
         # adjust the transition rates
         radiative_process.A = A * beta
         radiative_process.arbsorbtion_rate = absorbtion_rate * beta
