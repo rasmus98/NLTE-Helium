@@ -6,6 +6,7 @@ import astropy.constants as consts
 from astropy.modeling.physical_models import BlackBody
 from dataclasses import dataclass, field
 from scipy.integrate import quad, solve_ivp
+from scipy.optimize import root
 from functools import lru_cache, partial
 import NLTE.collision_rates
 import io 
@@ -59,7 +60,7 @@ class States:
             if col in ["j", "g"]:
                 nist_table[col] = pandas.to_numeric(nist_table[col])
         nist_table = nist_table[nist_table["Level (eV)"] < 30]
-        nist_table["n"] = nist_table["Configuration"].str.split(".").apply(lambda x: sum(int(re.match("(\d+)(\w)(2?)", y).group(1))-1 for y in x)+1)
+        nist_table["n"] = nist_table["Configuration"].str.split(".").apply(lambda x: sum(int(re.match(r"(\d+)(\w)(2?)", y).group(1))-1 for y in x)+1)
 
         nist_table["name"] = nist_table["n"].astype(str) + nist_table["Term"].str.replace("*", "")
         #for i, row in nist_table[nist_table["n"] <= 4].iterrows():
@@ -128,6 +129,22 @@ class Environment:
         self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
+def compute_tau(n_bound, states, A, environment):
+    eps0 = 1/(4 * np.pi) # i dont like gauss units
+    dE = states.energies[np.newaxis, :] - states.energies[:, np.newaxis]
+    valid = dE > 0 * dE.unit
+    lam = (np.abs(dE)+1e-16*u.eV).to("cm", equivalencies=u.spectral())
+    mult_ratio = states.multiplicities[np.newaxis, :] / states.multiplicities[:, np.newaxis]
+    n_ratio = n_bound[np.newaxis, :] / n_bound[:, np.newaxis]
+    ratio_term = mult_ratio - n_ratio
+    t_q = environment.t_d * u.day
+    tau = (lam**3 * eps0 * (A * u.s**-1) * (n_bound / 2)[:, np.newaxis] * ratio_term * t_q).to(u.dimensionless_unscaled)
+
+    # For invalid (i,j) transitions (i.e. where dE <= 0), set τ = 0.
+    tau[~valid] = 0
+
+    return tau.value
+
 # Solves the NLTE equations for the given environment and states
 # The solver uses the sobolev depth method to solve the NLTE equations
 # Iteration works follows:
@@ -141,31 +158,40 @@ def solve_NLTE_sob(environment, states, relaxation_steps = 5):
     A = radiative_process.A 
     absorbtion_rate = radiative_process.arbsorbtion_rate
     stimulated_emission_rate = radiative_process.stimulated_emission_rate
-
+    tau_prev = np.zeros((len(states.names), len(states.names)))
     # perform a few relaxation steps to get the correct sobolev depth
     for _ in range(relaxation_steps):
-        _, y = nlte_solver.solve(1e6)
-        n = y.T[-1,:-2] * u.cm**-3
-        eps0 = 1/(4 * np.pi) # i dont like gauss units
+        y = nlte_solver.solve()
+        n = y.T[:-2] * u.cm**-3
         tau = np.zeros((len(n), len(n)))
         # The sobolev depth is calculated individually for each transition
-        # Yes i know, loop, very inefficient, but this is a small matrix
-        for i in range(len(n)): 
-            for j in range(len(n)):
-                dE = states.energies[j] - states.energies[i]
-                if dE <= 0:
-                    continue
-                lam = dE.to("cm", equivalencies=u.spectral())
-                tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * environment.t_d * u.day
+        tau = compute_tau(n, states, radiative_process.A, environment)
         # calculate optical depth and escape probability        
         tau = np.maximum(tau,tau.T)+1e-8
+        tau = (tau + tau_prev)/2 # average the tau values for numerical stability
         beta = np.array((1-np.exp(-tau)) / tau)
+        tau_prev = tau
         # adjust the transition rates
         radiative_process.A = A * beta
         radiative_process.arbsorbtion_rate = absorbtion_rate * beta
         radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
-    return nlte_solver.solve(1e6)[1][:,-1], nlte_solver
         
+    y = nlte_solver.solve()
+    n = y.T[:-2] * u.cm**-3
+    tau = compute_tau(n, states, A, environment)
+    return nlte_solver.solve(), nlte_solver, tau
+ 
+def steady_state_eig(rate_matrix):
+    eigenvalues, eigenvectors = np.linalg.eig(rate_matrix)
+    index = np.argmin(np.abs(eigenvalues))
+    steady_state = eigenvectors[:, index].real
+    # Adjust sign so that most entries are positive.
+    if np.sum(steady_state < 0) > np.sum(steady_state >= 0):
+        steady_state = -steady_state
+    # Force nonnegative (this should not be necessary if the math is perfect)
+    steady_state = np.maximum(steady_state, 0)
+    steady_state = steady_state / steady_state.sum()
+    return steady_state
 
 # primary class, contains all the states and processes, and solves the system of differential equations
 class NLTESolver:
@@ -184,7 +210,12 @@ class NLTESolver:
     def get_transition_rate_matrix(self):
         return sum([process.get_transition_rate_matrix() for process in self.processes])
 
-    def solve(self, times):        
+    def solve(self):        
+        rate_matrix = self.get_transition_rate_matrix()
+        np.fill_diagonal(rate_matrix, -np.sum(rate_matrix, axis=0) + np.diag(rate_matrix))
+        return steady_state_eig(rate_matrix) * self.environment.n_He
+
+    def solve_time(self, times):        
         rate_matrix = self.get_transition_rate_matrix()
         np.fill_diagonal(rate_matrix, -np.sum(rate_matrix, axis=0) + np.diag(rate_matrix))
         initial = np.ones(len(self.states.all_names)) / len(self.states.all_names)
@@ -315,19 +346,25 @@ def get_ionization_dict():
             species[state] = (energies, cross)
     return species
 
+@lru_cache
 def get_ionization_rates(states, spectrum):
-    ionization_rates = []
     ionization_dict = get_ionization_dict()
-    for state in states.names:
-        energies, crossection = ionization_dict[state]
-        E = (energies * u.Ry).cgs
-        nu = E.to(u.Hz, equivalencies=u.spectral()) 
-        sigma = (crossection * u.Mbarn).cgs
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            ionization_flux_article = u.sr * sigma * (spectrum(nu)/E)
-        ionization_rates.append(np.trapz(x=nu, y=ionization_flux_article).to(1/u.s).value) 
-    return np.array(ionization_rates) * 4 * np.pi # TODO find out why the 16*pi is needed
+    energies, crossection = zip(*[ionization_dict[state] for state in states.names])
+    energies_flat = np.concatenate(energies)
+    crossection_flat = np.concatenate(crossection)
+
+    E = (energies_flat * u.Ry)
+    nu = E.to(u.Hz, equivalencies=u.spectral()) 
+    sigma = (crossection_flat * u.Mbarn)
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        ionization_flux_article = u.sr * sigma * (spectrum(nu)/E)
+    ionization_rates = []
+    indicies = [0] + list(np.cumsum([len(x) for x in  energies]))
+    for i1, i2 in zip(indicies[:-1], indicies[1:]):
+        ionization_rates.append(np.trapz(x=nu[i1:i2], y=ionization_flux_article[i1:i2]).to(1/u.s).value) 
+    return np.array(ionization_rates) * 4 * np.pi 
 
 @lru_cache
 def get_A_table():
@@ -337,7 +374,7 @@ def get_A_table():
     nist_table = nist_table[(nist_table['Aki(s^-1)'] != "")] # drop lines of no interest
 
     def get_state_name(config_series, term_series):
-        n = config_series.str.findall("(\d+)(\w)(2?)").apply(lambda x: str(1+sum([get_n(*nlm) for nlm in x])))
+        n = config_series.str.findall(r"(\d+)(\w)(2?)").apply(lambda x: str(1+sum([get_n(*nlm) for nlm in x])))
         return n+term_series.str.replace("*", "")
 
     nist_table["lower_name"] = get_state_name(nist_table["conf_i"], nist_table["term_i"])
@@ -366,7 +403,7 @@ def load_cross_sections():
     get_g = lambda name: all_states.multiplicities[all_states.names.index(name)]
 
     def get_cross_sections(filename, fit_function):
-        table = pandas.read_csv(filename, skiprows=6, skipfooter=5, engine="python", sep="\s+", index_col=[0,1], header=None, skip_blank_lines=True)
+        table = pandas.read_csv(filename, skiprows=6, skipfooter=5, engine="python", sep=r"\s+", index_col=[0,1], header=None, skip_blank_lines=True)
         clamped_fit_function = lambda E, A, i, f: np.where(E>get_E(f) - get_E(i), fit_function(E/(get_E(f) - get_E(i)), A), 0) * np.pi * consts.a0**2 * u.Ry / (get_g(i) * E)
         return {(i,f): partial(clamped_fit_function, A=A, i = i, f=f) for (i,f), A in table.T.to_dict("list").items()}
 
@@ -432,7 +469,7 @@ def read_recombination_data():
     coeff_filecontent = "".join(filecontent[314:])
     exp_number_format = r"[-+]?\d\.\d+E[+-]\d{2}"
     recombination_dict = {}
-    for statelabel, title, data in re.findall(f"(?:(\d{{8}}\.\d{{4}}) {exp_number_format}|(.*)=)\s+((?:{exp_number_format}\s+)+)", coeff_filecontent):
+    for statelabel, title, data in re.findall(rf"(?:(\d{{8}}\.\d{{4}}) {exp_number_format}|(.*)=)\s+((?:{exp_number_format}\s+)+)", coeff_filecontent):
         recombination_rates = np.array(list(map(float, data.strip().split())))
         if statelabel:
             n = int(statelabel[-4:-2])
